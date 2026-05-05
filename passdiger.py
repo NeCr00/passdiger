@@ -294,11 +294,14 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
         # Generic 'username:password' shape — risky by itself, so we apply
         # strict value-shape checks in _adjust_confidence (must look
         # password-like: have digit/special and decent entropy). Won't fire
-        # for k:v noise like 'time:14', 'port:8080', 'version:1.2'.
+        # for k:v noise like 'time:14', 'port:8080', 'version:1.2', or URL
+        # schemes like 'https://...' (the (?!//) lookahead rejects when
+        # the colon is followed by the URL scheme separator).
         "username_password_pair",
         re.compile(
             r"(?ix)(?<!://)"
             r"\b(?P<user>[a-zA-Z][a-zA-Z0-9._\-]{2,29}):"
+            r"(?!//)"
             r"(?P<val>[^\s:,;'\"`<>]{6,80})"
         ),
         70,
@@ -1383,6 +1386,28 @@ def format_table(report: AuditReport, mask: bool) -> str:
                 ]
             )
         out.write(_render_table(rows))
+
+        # Per-finding detail block — prints the FULL attribute value so the
+        # user can see context and decide whether each match is a real
+        # positive. Without this the table only shows the matched fragment.
+        out.write("\nFindings detail (full attribute values):\n")
+        out.write("=" * 78 + "\n")
+        for i, f in enumerate(findings, 1):
+            out.write(
+                f"\n[#{i}] {f.severity}/{f.confidence}  {f.detection_type}\n"
+            )
+            out.write(f"  Object   : {f.object_dn}\n")
+            out.write(
+                f"  Attribute: {f.attribute_name} ({f.attribute_classification})\n"
+            )
+            out.write(f"  Matched  : {_mask(f.matched_value, mask)}\n")
+            if f.notes:
+                out.write(f"  Notes    : {f.notes}\n")
+            out.write("  Full value:\n")
+            full = _mask(f.full_value or "", mask)
+            for line in (full.splitlines() or [""]):
+                out.write(f"    | {line}\n")
+        out.write("=" * 78 + "\n")
 
     if report.custom_attribute_dump:
         out.write(
