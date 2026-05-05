@@ -20,7 +20,7 @@ import math
 import re
 import ssl
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -177,9 +177,10 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
     (
         "default_password_phrase",
         re.compile(
-            r"(?i)\b(default|temp(orary)?|initial|new|admin|service|root)\s+"
-            r"(password|passwd|pwd|pass)\b[^a-zA-Z0-9]{1,4}"
-            r"(?P<val>[^\s,;'\"<>]{3,80})"
+            r"(?ix)\b(default|temp(orary)?|initial|new|admin|service|root)\s+"
+            r"(password|passwd|pwd|pass)\b"
+            r"(?:\s*[:=]\s*|\s+is\s+|\s+)"
+            r"['\"`]?(?P<val>[^\s,;'\"`<>]{4,80})['\"`]?"
         ),
         88,
         SEV_CRITICAL,
@@ -198,7 +199,7 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
         "sql_connection_string",
         re.compile(
             r"(?ix)(server|data\s*source|host|address|addr)\s*=\s*[^;]{3,200};"
-            r"[^=]{0,400}?(password|pwd)\s*=\s*(?P<val>[^;]+)"
+            r".{0,400}?(password|pwd)\s*=\s*(?P<val>[^;'\"<>]+)"
         ),
         96,
         SEV_CRITICAL,
@@ -218,12 +219,6 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
         re.compile(
             r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
         ),
-        99,
-        SEV_CRITICAL,
-    ),
-    (
-        "ssh_private_key_block",
-        re.compile(r"-----BEGIN OPENSSH PRIVATE KEY-----"),
         99,
         SEV_CRITICAL,
     ),
@@ -334,13 +329,16 @@ CREDENTIAL_KEYWORDS = (
     "session",
 )
 
-# Placeholder values we should never flag (asterisks, x's, lorem ipsum, etc.)
+# Placeholder values we should never flag (asterisks, x's, "REDACTED", etc.).
+# Kept conservative: words like "test"/"demo"/"secret" can be real (weak)
+# passwords, so we don't suppress them here — confidence scoring downstream
+# can downgrade if needed, but the user should still see the finding.
 PLACEHOLDER_VALUES = re.compile(
     r"^(?:"
     r"x+|X+|\*+|\.+|-+|<.*?>|\[.*?\]|"
     r"none|null|nil|n/?a|todo|tbd|pending|"
-    r"changeme|placeholder|example|sample|test|demo|"
-    r"redacted|hidden|removed|secret"
+    r"changeme|placeholder|"
+    r"redacted|hidden|removed"
     r")$",
     re.IGNORECASE,
 )
@@ -559,9 +557,14 @@ class CredentialDetector:
         if label == "sql_connection_string" and len(clean) < 4:
             conf -= 30
 
-        # password_keyvalue: avoid flagging "password reset link" prose.
-        if label == "password_keyvalue":
-            if clean.lower() in {"reset", "expired", "set", "change", "new", "required", "policy"}:
+        # password_keyvalue / default_password_phrase: avoid flagging prose
+        # like "password reset required" or "password policy: ...".
+        if label in {"password_keyvalue", "default_password_phrase"}:
+            if clean.lower() in {
+                "reset", "expired", "set", "change", "new", "required",
+                "policy", "rules", "complexity", "history", "minimum",
+                "maximum", "length", "age", "expires", "expiry", "expiration",
+            }:
                 return 0, ""
             if len(clean) < 4:
                 conf -= 20
@@ -621,14 +624,21 @@ class CredentialDetector:
             return None
         return decoded
 
-    @staticmethod
-    def _keyword_context(value: str) -> Optional[Tuple[str, str, int, str, str]]:
-        """Look for 'keyword <separator> token' where token has high entropy."""
-        for kw in CREDENTIAL_KEYWORDS:
-            pattern = re.compile(
+    _KEYWORD_CONTEXT_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+        (
+            kw,
+            re.compile(
                 rf"(?i)\b{re.escape(kw)}\b\s*(?:is|:|=|->)\s*"
                 rf"['\"`]?(?P<tok>[^\s,;'\"`<>]{{4,80}})['\"`]?"
-            )
+            ),
+        )
+        for kw in CREDENTIAL_KEYWORDS
+    ]
+
+    @classmethod
+    def _keyword_context(cls, value: str) -> Optional[Tuple[str, str, int, str, str]]:
+        """Look for 'keyword <separator> token' where token has high entropy."""
+        for kw, pattern in cls._KEYWORD_CONTEXT_PATTERNS:
             match = pattern.search(value)
             if not match:
                 continue
@@ -663,8 +673,12 @@ def _shannon_entropy(s: str) -> float:
 
 
 def _truncate(s: str, n: int) -> str:
+    if n <= 0:
+        return ""
     if len(s) <= n:
         return s
+    if n <= 3:
+        return "." * n
     return s[: n - 3] + "..."
 
 
@@ -856,22 +870,43 @@ def paged_object_search(
 
 
 def coerce_value(raw: Any) -> Optional[str]:
-    """Convert ldap3 attribute payloads to a printable string for inspection."""
+    """Convert ldap3 attribute payloads to a printable string for inspection.
+
+    Returns None for values that decode to mostly-unprintable junk, so the
+    detector and dump paths never see binary garbage that just happens to
+    decode under utf-16-le.
+    """
     if raw is None:
         return None
     if isinstance(raw, list):
-        # Collapse multi-valued attrs into newline-separated strings for scanning.
         parts = [coerce_value(v) for v in raw]
         parts = [p for p in parts if p]
         return "\n".join(parts) if parts else None
     if isinstance(raw, (bytes, bytearray)):
+        decoded: Optional[str] = None
         try:
-            return raw.decode("utf-8")
+            candidate = raw.decode("utf-8")
+            # AD frequently stores text as UTF-16-LE. Such bytes also decode
+            # cleanly as UTF-8 (each byte < 0x80) but yield embedded nulls;
+            # in that case re-decode as UTF-16-LE to recover the real text.
+            if "\x00" in candidate:
+                try:
+                    decoded = raw.decode("utf-16-le")
+                except UnicodeDecodeError:
+                    decoded = candidate
+            else:
+                decoded = candidate
         except UnicodeDecodeError:
             try:
-                return raw.decode("utf-16-le")
+                decoded = raw.decode("utf-16-le")
             except UnicodeDecodeError:
                 return None
+        if not decoded:
+            return None
+        printable = sum(1 for c in decoded if c.isprintable() or c in "\r\n\t")
+        if printable / len(decoded) < 0.85:
+            return None
+        return decoded
     if isinstance(raw, (int, float, bool)):
         return str(raw)
     if isinstance(raw, datetime):
@@ -962,8 +997,11 @@ def audit_entry(
                     )
                 )
 
-        # Always-dump-custom for visibility.
-        if show_all_custom and is_custom:
+        # Always-dump-custom for visibility. In schema-fallback mode the
+        # custom set is empty and unknown-classified attrs are effectively
+        # custom from the user's perspective, so dump them too.
+        should_dump = is_custom or (cls == "unknown" and not is_common)
+        if show_all_custom and should_dump:
             dumps.append(
                 CustomAttributeDump(
                     object_dn=dn,
