@@ -14,13 +14,14 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import html as _html
 import io
 import json
 import math
 import re
 import ssl
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -57,56 +58,47 @@ SEVERITY_RANK = {SEV_LOW: 1, SEV_MEDIUM: 2, SEV_HIGH: 3, SEV_CRITICAL: 4}
 # was added later, almost always by a schema extension or a customer.
 FLAG_SCHEMA_BASE_OBJECT = 0x10
 
-# The "credential-prone" attributes that AD admins routinely (and often
-# accidentally) use to store passwords, recovery keys, vendor secrets, etc.
+# Tight allowlist of built-in attributes the auditor checks for credentials.
+# This is the *only* set of standard AD attrs we scan — everything else
+# (samAccountName, objectSID, name, mail, telephoneNumber, …) is rejected
+# from the audit because admins do not use those fields to store passwords.
+# Custom attributes (schema extensions) are always inspected separately.
 COMMON_INSPECTION_ATTRS = {
     "description",
-    "comment",
     "info",
-    "displayname",
-    "notes",
-    "title",
-    "department",
-    "company",
-    "physicaldeliveryofficename",
-    "wwwhomepage",
-    "url",
-    "useraccountcontrol",
+    "comment",
     "userpassword",
     "unixuserpassword",
+    "unicodepwd",
+    "mssfu30password",
     "ms-mcs-admpwd",
-    "ms-laps-password",
-    "ms-laps-encryptedpassword",
-    "ms-laps-encryptedpasswordhistory",
-    "scriptpath",
-    "homedirectory",
-    "profilepath",
-    "employeenumber",
-    "employeeid",
-    "personaltitle",
-    "carlicense",
-    "homephone",
-    "mobile",
-    "pager",
-    "telephonenumber",
-    "facsimiletelephonenumber",
-    "ipphone",
-    "otherhomephone",
-    "othertelephone",
-    "othermobile",
-    "otherpager",
-    "otheripphone",
-    "otherfacsimiletelephonenumber",
-    "streetaddress",
-    "postaladdress",
-    "postofficebox",
-    "userprincipalname",
-    "samaccountname",
+    "mslaps-password",
+    "mslaps-encryptedpassword",
+    "msds-managedpassword",
+    "msds-keycredentiallink",
+    "gecos",
+    "displayname",
+    "wwwhomepage",
 }
-COMMON_INSPECTION_ATTRS.update({f"extensionattribute{i}" for i in range(1, 16)})
 
-# Attributes that are large, binary, or that contain operational data we
-# never want to scan or print. Matching is case-insensitive.
+# Attributes whose mere presence-with-a-value is itself a finding, regardless
+# of what the value looks like. These are AD's known password / credential
+# attributes — if the auditor read a value, that is the leak.
+# Map: lower-cased attr name -> (severity, confidence, explanatory note).
+CREDENTIAL_ATTRS: Dict[str, Tuple[str, int, str]] = {
+    "userpassword":             (SEV_CRITICAL, 99, "Cleartext userPassword exposed"),
+    "unixuserpassword":         (SEV_CRITICAL, 99, "Cleartext unixUserPassword exposed"),
+    "unicodepwd":               (SEV_CRITICAL, 99, "unicodePwd readable (extremely unusual; AD normally hides this)"),
+    "mssfu30password":          (SEV_CRITICAL, 99, "msSFU30Password (Unix services for AD) exposed"),
+    "ms-mcs-admpwd":            (SEV_CRITICAL, 99, "LAPS cleartext local-admin password readable"),
+    "mslaps-password":          (SEV_CRITICAL, 99, "LAPS v2 (Windows LAPS) cleartext password readable"),
+    "mslaps-encryptedpassword": (SEV_HIGH,     90, "LAPS v2 encrypted password readable (DPAPI-NG decryptable by privileged accounts)"),
+    "msds-managedpassword":     (SEV_CRITICAL, 99, "gMSA managed-password blob readable"),
+    "msds-keycredentiallink":   (SEV_MEDIUM,   75, "msDS-KeyCredentialLink (WHfB key creds) readable"),
+}
+
+# Attributes we never scan or dump regardless of their classification:
+# binary blobs, security descriptors, hash histories, large operational data.
 SKIP_ATTRS = {
     "objectsid",
     "objectguid",
@@ -118,7 +110,6 @@ SKIP_ATTRS = {
     "msexchmailboxsecuritydescriptor",
     "ntsecuritydescriptor",
     "msds-allowedtoactonbehalfofotheridentity",
-    "msds-keycredentiallink",
     "logonhours",
     "dnscord",
     "dnsrecord",
@@ -128,10 +119,8 @@ SKIP_ATTRS = {
     "tokengroups",
     "tokengroupsglobalanduniversal",
     "tokengroupsnogcacceptable",
-    # Hashes & blobs we cannot meaningfully inspect or that are hashes.
     "ntpwdhistory",
     "lmpwdhistory",
-    "unicodepwd",
     "supplementalcredentials",
     "dbcsfwd",
     "msds-revealedusers",
@@ -140,19 +129,69 @@ SKIP_ATTRS = {
     "attributesecurityguid",
 }
 
-# Default object filter focuses on directory principals where credentials
-# are most commonly leaked. Override with --filter for full scope.
+# Comprehensive list of standard AD attribute names used as a *classification
+# fallback* when the schema partition can't be read (e.g. anonymous bind on a
+# locked-down DC). Without this, attrs like samAccountName/cn/memberOf would
+# fall into the "unknown" bucket and get scanned/dumped, producing noise. We
+# never scan attrs in this list — only attrs in COMMON_INSPECTION_ATTRS or
+# real custom attrs.
+KNOWN_AD_ATTRS = {
+    # core identity
+    "objectclass", "objectcategory", "objectguid", "objectsid",
+    "samaccountname", "samaccounttype", "userprincipalname",
+    "name", "cn", "distinguishedname", "givenname", "sn", "initials",
+    "displayname", "displaynameprintable",
+    "altsecurityidentities", "personaltitle", "carlicense",
+    "employeeid", "employeenumber", "employeetype",
+    # contact / address
+    "mail", "proxyaddresses", "mailnickname",
+    "telephonenumber", "mobile", "homephone", "pager",
+    "facsimiletelephonenumber", "ipphone",
+    "othertelephone", "othermobile", "otherhomephone", "otherpager",
+    "otherfacsimiletelephonenumber", "otheripphone",
+    "streetaddress", "postaladdress", "postofficebox", "postalcode",
+    "homepostaladdress", "physicaldeliveryofficename",
+    "l", "st", "co", "c", "countrycode",
+    # org / manager
+    "department", "company", "title", "manager", "directreports",
+    # group / membership
+    "memberof", "member", "primarygroupid", "grouptype", "groupterm",
+    # account flags / pwd metadata
+    "useraccountcontrol", "accountexpires", "badpwdcount", "badpasswordtime",
+    "lastlogon", "lastlogontimestamp", "lastlogoff", "logoncount",
+    "lockouttime", "pwdlastset", "lastpwdset",
+    "userworkstations", "useworkstations",
+    # paths / scripts / OS
+    "homedirectory", "homedrive", "scriptpath", "profilepath",
+    "url",  # often holds vendor URL but not a credential channel
+    "dnshostname", "serviceprincipalname",
+    "operatingsystem", "operatingsystemversion",
+    "operatingsystemservicepack", "operatingsystemhotfix",
+    # POSIX / SFU
+    "uidnumber", "gidnumber", "loginshell", "uid",
+    # change tracking / operational
+    "instancetype", "whencreated", "whenchanged", "usnchanged", "usncreated",
+    "createtimestamp", "modifytimestamp", "creatorsname", "modifiersname",
+    "entrydn", "entryuuid", "subschemasubentry",
+    # rid / replication metadata
+    "ridtype", "rid", "ridmanagerreference", "ridmanager",
+    "ridallocationpool", "ridsetreferences",
+    # Exchange & misc operational
+    "homemta", "ridallocationpool", "rolloversequence",
+    "logontime", "iis6applicationpool",
+    # extensionAttribute1..15 used by Exchange — admins do sometimes write
+    # passwords here, but it's noisy by default; NOT included in COMMON
+    # but also not in KNOWN_AD_ATTRS so they will be classified as
+    # built-in via schema and ignored.
+}
+
+# Default object filter — by request, restricted to user accounts and groups
+# only. Excludes computers (objectCategory=computer), contacts, OUs, GPOs,
+# foreign-security-principals, etc. Override with --filter to broaden.
 DEFAULT_OBJECT_FILTER = (
     "(|"
-    "(objectClass=user)"
-    "(objectClass=computer)"
+    "(&(objectCategory=person)(objectClass=user))"
     "(objectClass=group)"
-    "(objectClass=contact)"
-    "(objectClass=msDS-ManagedServiceAccount)"
-    "(objectClass=msDS-GroupManagedServiceAccount)"
-    "(objectClass=organizationalUnit)"
-    "(objectClass=foreignSecurityPrincipal)"
-    "(objectClass=inetOrgPerson)"
     ")"
 )
 
@@ -168,7 +207,7 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
     (
         "password_keyvalue",
         re.compile(
-            r"(?ix)\b(password|passwd|pwd|pass|secret|passphrase)\s*[:=]\s*"
+            r"(?ix)\b(password|passwd|pwd|pass|secret|passphrase|passcode|creds?)\s*[:=]\s*"
             r"(?P<val>(?:\"[^\"\n]{2,200}\"|'[^'\n]{2,200}'|[^\s,;'\"<>]{3,200}))"
         ),
         92,
@@ -193,6 +232,76 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
             r"(?P<val>(?:\"[^\"\n]{4,200}\"|'[^'\n]{4,200}'|[^\s,;'\"<>]{6,200}))"
         ),
         90,
+        SEV_HIGH,
+    ),
+    (
+        # XML / config-file shape: <password>VALUE</password>, also matches
+        # <secret>, <token>, etc. with matching close tags.
+        "xml_password_tag",
+        re.compile(
+            r"(?is)<\s*(?P<tag>password|passwd|pwd|secret|api[_-]?key|token|"
+            r"client[_-]?secret|credentials?)\s*>"
+            r"(?P<val>[^<]{3,400})"
+            r"<\s*/\s*(?P=tag)\s*>"
+        ),
+        93,
+        SEV_CRITICAL,
+    ),
+    (
+        # CLI flag form: --password VALUE, --secret=VALUE, etc.
+        "cli_password_flag",
+        re.compile(
+            r"(?ix)(?:^|\s|;)--?(password|passwd|pwd|secret|api[_-]?key|token"
+            r"|client[_-]?secret|p)\b(?:\s*[=]\s*|\s+)"
+            r"['\"`]?(?P<val>[^\s'\"`<>]{4,200})['\"`]?"
+        ),
+        85,
+        SEV_HIGH,
+    ),
+    (
+        # Imperative natural language: "set password to X", "use password X",
+        # "change pwd as Y", "reset password = Z". The connector
+        # (to|as|=|is|equals|->) is optional so "use password X" matches.
+        "set_password_phrase",
+        re.compile(
+            r"(?ix)\b(?:set|use|change|update|reset|new)\s+(?:the\s+|a\s+|new\s+)*"
+            r"(?:password|passwd|pwd|pass|secret|passphrase)\s+"
+            r"(?:(?:to|as|=|is|equals?|of|->)\s+)?"
+            r"['\"`]?(?P<val>[^\s,;'\"`<>]{4,200})['\"`]?"
+        ),
+        87,
+        SEV_HIGH,
+    ),
+    (
+        # Context-bracketed credential pair: a credential keyword nearby
+        # plus a "user:pass" or "user/pass" pair.
+        # Examples:
+        #   "creds: admin:Welcome24"
+        #   "Login: jdoe / S3cr3t"
+        #   "Account john - W3lc0me!"
+        "credential_pair_with_context",
+        re.compile(
+            r"(?ix)\b(credentials?|creds?|login|account|userpass|userpw|access)\b"
+            r"[^a-zA-Z0-9\n]{1,30}"
+            r"(?P<user>[a-zA-Z][a-zA-Z0-9._\-@]{1,30})"
+            r"\s*[:/\\\-]\s*"
+            r"(?P<val>[^\s,;'\"`<>]{4,80})"
+        ),
+        82,
+        SEV_HIGH,
+    ),
+    (
+        # Generic 'username:password' shape — risky by itself, so we apply
+        # strict value-shape checks in _adjust_confidence (must look
+        # password-like: have digit/special and decent entropy). Won't fire
+        # for k:v noise like 'time:14', 'port:8080', 'version:1.2'.
+        "username_password_pair",
+        re.compile(
+            r"(?ix)(?<!://)"
+            r"\b(?P<user>[a-zA-Z][a-zA-Z0-9._\-]{2,29}):"
+            r"(?P<val>[^\s:,;'\"`<>]{6,80})"
+        ),
+        70,
         SEV_HIGH,
     ),
     (
@@ -308,6 +417,70 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
         95,
         SEV_HIGH,
     ),
+    (
+        "argon2_hash",
+        re.compile(
+            r"\$argon2(?:i|d|id)\$v=\d+\$m=\d+,t=\d+,p=\d+\$"
+            r"[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+"
+        ),
+        97,
+        SEV_CRITICAL,
+    ),
+    (
+        "htpasswd_md5",
+        re.compile(r"\$apr1\$[./0-9A-Za-z]{1,8}\$[./0-9A-Za-z]{22}"),
+        96,
+        SEV_CRITICAL,
+    ),
+    (
+        "anthropic_api_key",
+        re.compile(r"\bsk-ant-(?:api|admin)\d+-[A-Za-z0-9_\-]{20,}\b"),
+        98,
+        SEV_CRITICAL,
+    ),
+    (
+        "openai_project_key",
+        re.compile(r"\bsk-proj-[A-Za-z0-9_\-]{20,}\b"),
+        92,
+        SEV_HIGH,
+    ),
+    (
+        "bearer_token",
+        re.compile(
+            r"(?i)\b(?:authorization\s*[:=]\s*)?bearer\s+"
+            r"(?P<val>[A-Za-z0-9_\-\.+/=]{16,})"
+        ),
+        80,
+        SEV_HIGH,
+    ),
+    (
+        "basic_auth_b64",
+        re.compile(
+            r"(?i)\b(?:authorization\s*[:=]\s*)?basic\s+"
+            r"(?P<val>[A-Za-z0-9+/=]{12,})"
+        ),
+        78,
+        SEV_HIGH,
+    ),
+    (
+        # Catch-all heuristic: the attribute value just *mentions* a
+        # credential-related keyword. Confidence is intentionally low
+        # (default min_confidence=55 hides it) so this pattern only
+        # surfaces when the user explicitly lowers --min-confidence to
+        # do an aggressive review pass. Useful for catching attributes
+        # where someone wrote prose like "user has a password" or
+        # "his secret is in the safe" without exposing the value
+        # itself, but still worth a manual review.
+        "credential_keyword_present",
+        re.compile(
+            r"(?i)\b(passwords?|passwd|pwd|pass(?:phrase|code|word)?|"
+            r"secrets?|credentials?|creds?|"
+            r"api[_-]?keys?|access[_-]?keys?|private[_-]?keys?|"
+            r"client[_-]?secrets?|auth[_-]?tokens?|bearer|tokens?|keys?)\b"
+        ),
+        35,
+        SEV_LOW,
+    ),
 ]
 
 # Keywords used for context-based detection inside otherwise opaque blobs.
@@ -330,18 +503,32 @@ CREDENTIAL_KEYWORDS = (
 )
 
 # Placeholder values we should never flag (asterisks, x's, "REDACTED", etc.).
-# Kept conservative: words like "test"/"demo"/"secret" can be real (weak)
-# passwords, so we don't suppress them here — confidence scoring downstream
-# can downgrade if needed, but the user should still see the finding.
+# The bracket alternatives are pinned to known placeholder words so we don't
+# accidentally fullmatch real XML/JSON wrappers like <password>X</password>.
 PLACEHOLDER_VALUES = re.compile(
     r"^(?:"
-    r"x+|X+|\*+|\.+|-+|<.*?>|\[.*?\]|"
+    r"x+|X+|\*+|\.+|-+|"
+    r"<(?:empty|placeholder|none|null|todo|tbd|redacted|hidden|removed|insert[\w\s]*here|n/?a)>|"
+    r"\[(?:empty|placeholder|none|null|todo|tbd|redacted|hidden|removed|insert[\w\s]*here|n/?a)\]|"
     r"none|null|nil|n/?a|todo|tbd|pending|"
     r"changeme|placeholder|"
     r"redacted|hidden|removed"
     r")$",
     re.IGNORECASE,
 )
+
+# Words that frequently appear *adjacent* to "password" in policy/prose
+# (e.g. "password reset required", "password complexity rules"). Used by
+# pattern-rejection logic to avoid flagging policy text as a credential.
+PROSE_REJECT_WORDS = {
+    "reset", "expired", "set", "change", "new", "required",
+    "policy", "rules", "complexity", "history", "minimum",
+    "maximum", "length", "age", "expires", "expiry", "expiration",
+    "should", "must", "would", "will", "can", "may",
+    "strong", "weak", "secure", "compliant",
+    "true", "false", "none", "null", "empty", "default",
+    "yes", "no", "valid", "invalid",
+}
 
 # Patterns we should never treat as a secret even if they look high-entropy.
 NON_SECRET_PATTERNS = (
@@ -387,6 +574,27 @@ class CustomAttributeDump:
 
 
 @dataclass
+class CheckedAttribute:
+    """One row of the per-object dump emitted with --dump-checked-attrs.
+
+    Captures every attribute that the auditor *checked* for each object —
+    credential-prone built-ins (description/info/comment/...) plus every
+    custom attribute. Includes attributes where no finding fired, giving
+    the user full visibility into what was inspected and why.
+    """
+
+    object_dn: str
+    object_class: str
+    attribute_name: str
+    attribute_classification: str  # built-in / custom / unknown
+    value: str
+    has_finding: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class AuditReport:
     started_at: str
     finished_at: str
@@ -398,6 +606,7 @@ class AuditReport:
     attributes_scanned: int
     findings: List[Finding] = field(default_factory=list)
     custom_attribute_dump: List[CustomAttributeDump] = field(default_factory=list)
+    checked_attribute_dump: List[CheckedAttribute] = field(default_factory=list)
     builtin_attribute_count: int = 0
     custom_attribute_count: int = 0
     schema_resolved: bool = False
@@ -418,6 +627,7 @@ class AuditReport:
             "summary": self.summary(),
             "findings": [f.to_dict() for f in self.findings],
             "custom_attribute_dump": [c.to_dict() for c in self.custom_attribute_dump],
+            "checked_attribute_dump": [c.to_dict() for c in self.checked_attribute_dump],
         }
 
     def summary(self) -> Dict[str, int]:
@@ -557,17 +767,65 @@ class CredentialDetector:
         if label == "sql_connection_string" and len(clean) < 4:
             conf -= 30
 
-        # password_keyvalue / default_password_phrase: avoid flagging prose
-        # like "password reset required" or "password policy: ...".
-        if label in {"password_keyvalue", "default_password_phrase"}:
-            if clean.lower() in {
-                "reset", "expired", "set", "change", "new", "required",
-                "policy", "rules", "complexity", "history", "minimum",
-                "maximum", "length", "age", "expires", "expiry", "expiration",
-            }:
+        # password_keyvalue / default_password_phrase / set_password_phrase /
+        # cli_password_flag: avoid flagging prose like "password reset
+        # required" or "password policy: ...".
+        if label in {
+            "password_keyvalue", "default_password_phrase",
+            "set_password_phrase", "cli_password_flag",
+        }:
+            if clean.lower() in PROSE_REJECT_WORDS:
                 return 0, ""
             if len(clean) < 4:
                 conf -= 20
+
+        # credential_pair_with_context: reject when the value is itself a
+        # credential keyword (e.g. "Account john / Pass W3lc..." would
+        # capture val="Pass" first).
+        if label == "credential_pair_with_context":
+            if clean.lower() in {
+                "password", "passwd", "pwd", "pass", "secret", "passphrase",
+                "credentials", "creds", "login", "user", "username",
+            } or clean.lower() in PROSE_REJECT_WORDS:
+                return 0, ""
+
+        # username_password_pair: this is a generic K:V shape with high
+        # FP risk. Require the value to look genuinely password-like:
+        # have digits OR special chars AND length >= 6, and reject obvious
+        # k:v noise (port:NUM, version:N.N.N, dates, true/false, etc.).
+        if label == "username_password_pair":
+            if clean.lower() in (PROSE_REJECT_WORDS | {
+                "tcp", "udp", "http", "https", "smtp", "imap", "pop3",
+                "localhost", "internal", "external", "public", "private",
+            }):
+                return 0, ""
+            # Numeric-only value is a port/timestamp/ID, not a credential.
+            if clean.isdigit():
+                return 0, ""
+            # IP-like: x.y.z.w
+            if re.fullmatch(r"\d+(?:\.\d+){2,}\.?\d*", clean):
+                return 0, ""
+            # Date- or time-shaped values: 2024-01-15, 14:30:00, 12/31/24, etc.
+            if re.fullmatch(r"\d{1,4}[-/.:]\d{1,4}([-/.:]\d{1,4})*Z?", clean):
+                return 0, ""
+            # Pure digits + separators (date/time/version-like).
+            if re.fullmatch(r"[\d\-/.:]+", clean):
+                return 0, ""
+            has_digit = any(c.isdigit() for c in clean)
+            has_special = any(c in "!@#$%^&*()_+-=[]{}|\\,.<>/?`~" for c in clean)
+            has_upper = any(c.isupper() for c in clean)
+            has_lower = any(c.islower() for c in clean)
+            score = 0
+            if has_digit:                score += 1
+            if has_special:              score += 1
+            if has_upper and has_lower:  score += 1
+            if len(clean) >= 8:          score += 1
+            if score < 2:
+                return 0, ""
+            # Higher score → boost confidence up to ~80
+            conf = min(85, conf + (score - 2) * 5)
+            notes.append(f"value-shape score={score} (digit={has_digit}, "
+                         f"special={has_special}, mixed-case={has_upper and has_lower})")
 
         return max(0, min(100, conf)), "; ".join(notes)
 
@@ -628,7 +886,8 @@ class CredentialDetector:
         (
             kw,
             re.compile(
-                rf"(?i)\b{re.escape(kw)}\b\s*(?:is|:|=|->)\s*"
+                rf"(?i)\b{re.escape(kw)}\b\s*"
+                rf"(?:is|equals?|set\s+to|set\s+as|:|=|=>|->)\s+"
                 rf"['\"`]?(?P<tok>[^\s,;'\"`<>]{{4,80}})['\"`]?"
             ),
         )
@@ -644,6 +903,10 @@ class CredentialDetector:
                 continue
             token = match.group("tok")
             if PLACEHOLDER_VALUES.fullmatch(token):
+                continue
+            # Reject prose words that aren't real credential values, e.g.
+            # "password equals expired" / "secret is required" / etc.
+            if token.lower() in PROSE_REJECT_WORDS:
                 continue
             entropy = _shannon_entropy(token)
             if entropy < 2.5 and not any(c.isdigit() for c in token):
@@ -923,12 +1186,25 @@ def coerce_value(raw: Any) -> Optional[str]:
 def attribute_classification(
     name: str, builtin: Set[str], custom: Set[str]
 ) -> str:
+    """Classify an attribute name as 'built-in', 'custom', or 'unknown'.
+
+    Order of resolution:
+      1. The schema-derived ``builtin`` and ``custom`` sets (authoritative).
+      2. Our hard-coded COMMON_INSPECTION_ATTRS list (always built-in).
+      3. The KNOWN_AD_ATTRS fallback list (always built-in) — covers the
+         common AD defaults (samAccountName, cn, memberOf, …) so that when
+         the schema partition is unreadable we still classify them as
+         built-in and exclude them from scanning / dumping.
+      4. Otherwise 'unknown' — handled like a custom attr.
+    """
     n = name.lower()
     if n in builtin:
         return "built-in"
     if n in custom:
         return "custom"
     if n in COMMON_INSPECTION_ATTRS:
+        return "built-in"
+    if n in KNOWN_AD_ATTRS:
         return "built-in"
     return "unknown"
 
@@ -955,10 +1231,21 @@ def audit_entry(
     custom_attrs: Set[str],
     show_all_custom: bool,
     inspect_only_common: bool,
-) -> Tuple[List[Finding], List[CustomAttributeDump], int]:
-    """Audit a single search entry, returning findings and the dump rows."""
+    dump_checked_attrs: bool = False,
+) -> Tuple[List[Finding], List[CustomAttributeDump], List[CheckedAttribute], int]:
+    """Audit a single search entry.
+
+    Returns a tuple of:
+      (findings, custom_attr_dumps, checked_attr_dumps, attrs_scanned)
+
+    The ``checked_attr_dumps`` list is only populated when ``dump_checked_attrs``
+    is True and contains every credential-prone built-in attribute plus every
+    custom attribute on the object — even when no finding fired, giving the
+    user full visibility into what was inspected.
+    """
     findings: List[Finding] = []
     dumps: List[CustomAttributeDump] = []
+    checked: List[CheckedAttribute] = []
 
     dn = entry.get("dn") or entry.get("raw_dn") or "<unknown DN>"
     attrs = entry.get("attributes", {}) or {}
@@ -985,10 +1272,36 @@ def audit_entry(
             # 'unknown' (= attribute name not seen in schema) is rare; treat as custom-like
             should_scan = not inspect_only_common
 
+        attribute_findings: List[Finding] = []
         if should_scan:
             attrs_scanned += 1
-            for label, matched, conf, sev, note in detector.detect(coerced):
-                findings.append(
+
+            # Stage A: built-in credential attributes — the *presence* of
+            # any value is itself a critical finding regardless of content.
+            attr_lower = attr_name.lower()
+            if attr_lower in CREDENTIAL_ATTRS:
+                sev, conf, note = CREDENTIAL_ATTRS[attr_lower]
+                attribute_findings.append(
+                    Finding(
+                        object_dn=dn,
+                        object_class=obj_class,
+                        attribute_name=attr_name,
+                        attribute_classification=cls,
+                        detection_type="sensitive_attribute_exposed",
+                        severity=sev,
+                        confidence=conf,
+                        matched_value=_truncate(coerced, 200),
+                        full_value=_truncate(coerced, 500),
+                        notes=note,
+                    )
+                )
+
+            # Stage B: pattern-based detection on the value itself. Runs
+            # for every scanned attribute (including credential attrs above
+            # — sometimes the value also matches an additional pattern
+            # like a hash format or embedded URL).
+            for label, matched, conf, sev, det_note in detector.detect(coerced):
+                attribute_findings.append(
                     Finding(
                         object_dn=dn,
                         object_class=obj_class,
@@ -999,15 +1312,16 @@ def audit_entry(
                         confidence=conf,
                         matched_value=matched,
                         full_value=_truncate(coerced, 500),
-                        notes=note,
+                        notes=det_note,
                     )
                 )
+        findings.extend(attribute_findings)
 
         # Always-dump-custom for visibility. In schema-fallback mode the
         # custom set is empty and unknown-classified attrs are effectively
         # custom from the user's perspective, so dump them too.
-        should_dump = is_custom or (cls == "unknown" and not is_common)
-        if show_all_custom and should_dump:
+        should_dump_custom = is_custom or (cls == "unknown" and not is_common)
+        if show_all_custom and should_dump_custom:
             dumps.append(
                 CustomAttributeDump(
                     object_dn=dn,
@@ -1017,7 +1331,22 @@ def audit_entry(
                 )
             )
 
-    return findings, dumps, attrs_scanned
+        # --dump-checked-attrs: emit every credential-prone built-in attr
+        # AND every custom/unknown attr, with or without a finding. This
+        # gives the user full visibility into what was inspected per object.
+        if dump_checked_attrs and (is_common or should_dump_custom):
+            checked.append(
+                CheckedAttribute(
+                    object_dn=dn,
+                    object_class=obj_class,
+                    attribute_name=attr_name,
+                    attribute_classification=cls,
+                    value=_truncate(coerced, 500),
+                    has_finding=bool(attribute_findings),
+                )
+            )
+
+    return findings, dumps, checked, attrs_scanned
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1400,24 @@ def format_table(report: AuditReport, mask: bool) -> str:
             )
         out.write(_render_table(rows))
 
+    if report.checked_attribute_dump:
+        out.write(
+            f"\nChecked attribute dump ({len(report.checked_attribute_dump)} "
+            "entries — every credential-prone built-in plus all custom attrs):\n"
+        )
+        rows = [["OBJECT", "ATTR", "CLASS", "FIND?", "VALUE"]]
+        for c in report.checked_attribute_dump:
+            rows.append(
+                [
+                    _shorten_dn(c.object_dn, 50),
+                    c.attribute_name,
+                    c.attribute_classification,
+                    "yes" if c.has_finding else "no",
+                    _mask(_truncate(c.value, 80), mask),
+                ]
+            )
+        out.write(_render_table(rows))
+
     out.write("\n")
     out.write(_format_summary(report))
     return out.getvalue()
@@ -1084,6 +1431,34 @@ def format_json(report: AuditReport, mask: bool) -> str:
             f["full_value"] = _mask(f["full_value"], True)
         for c in payload["custom_attribute_dump"]:
             c["value"] = _mask(c["value"], True)
+        for c in payload["checked_attribute_dump"]:
+            c["value"] = _mask(c["value"], True)
+
+    # When the user asks for a checked-attr dump, also expose a per-object
+    # grouped view that's easier to consume than the flat list.
+    if payload["checked_attribute_dump"]:
+        grouped: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        for c in payload["checked_attribute_dump"]:
+            obj = grouped.setdefault(
+                c["object_dn"],
+                {
+                    "object_dn": c["object_dn"],
+                    "object_class": c["object_class"],
+                    "common_attributes": {},
+                    "custom_attributes": {},
+                },
+            )
+            target = (
+                obj["custom_attributes"]
+                if c["attribute_classification"] in ("custom", "unknown")
+                else obj["common_attributes"]
+            )
+            target[c["attribute_name"]] = {
+                "value": c["value"],
+                "has_finding": c["has_finding"],
+            }
+        payload["checked_attribute_dump_by_object"] = list(grouped.values())
+
     return json.dumps(payload, indent=2, default=str)
 
 
@@ -1128,7 +1503,241 @@ def format_csv(report: AuditReport, mask: bool) -> str:
             writer.writerow(
                 [d.object_dn, d.object_class, d.attribute_name, _mask(d.value, mask)]
             )
+    if report.checked_attribute_dump:
+        writer.writerow([])
+        writer.writerow(
+            [
+                "checked_dump_object_dn",
+                "object_class",
+                "attribute_name",
+                "attribute_classification",
+                "has_finding",
+                "value",
+            ]
+        )
+        for c in report.checked_attribute_dump:
+            writer.writerow(
+                [
+                    c.object_dn,
+                    c.object_class,
+                    c.attribute_name,
+                    c.attribute_classification,
+                    "yes" if c.has_finding else "no",
+                    _mask(c.value, mask),
+                ]
+            )
     return out.getvalue()
+
+
+def format_html(report: AuditReport, mask: bool) -> str:
+    """Render the report as a self-contained HTML document with inline styles."""
+    e = _html.escape
+    findings = sorted(
+        report.findings,
+        key=lambda f: (-SEVERITY_RANK[f.severity], -f.confidence, f.object_dn),
+    )
+    summary = report.summary()
+
+    grouped: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    for c in report.checked_attribute_dump:
+        obj = grouped.setdefault(
+            c.object_dn,
+            {
+                "object_dn": c.object_dn,
+                "object_class": c.object_class,
+                "common": [],
+                "custom": [],
+            },
+        )
+        bucket = "custom" if c.attribute_classification in ("custom", "unknown") else "common"
+        obj[bucket].append(c)
+
+    parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
+    parts.append('<html lang="en"><head>')
+    parts.append('<meta charset="utf-8">')
+    parts.append(f"<title>passdiger report — {e(report.domain)}</title>")
+    parts.append(_HTML_STYLE)
+    parts.append("</head><body>")
+    parts.append(f'<h1>passdiger report</h1>')
+    parts.append('<section class="meta"><table>')
+    for label, value in (
+        ("Domain", report.domain),
+        ("Domain controller", report.domain_controller),
+        ("Base DN", report.base_dn),
+        ("Bind", report.bind),
+        ("Schema resolved", str(report.schema_resolved)),
+        ("Built-in attrs (schema)", str(report.builtin_attribute_count)),
+        ("Custom attrs (schema)", str(report.custom_attribute_count)),
+        ("Objects scanned", str(report.objects_scanned)),
+        ("Attributes scanned", str(report.attributes_scanned)),
+        ("Started", report.started_at),
+        ("Finished", report.finished_at),
+    ):
+        parts.append(f"<tr><th>{e(label)}</th><td>{e(value)}</td></tr>")
+    parts.append("</table></section>")
+
+    parts.append('<section class="summary"><h2>Severity counts</h2><div class="cards">')
+    for sev, cls in (
+        (SEV_CRITICAL, "crit"), (SEV_HIGH, "high"),
+        (SEV_MEDIUM, "med"), (SEV_LOW, "low"),
+    ):
+        parts.append(
+            f'<div class="card sev-{cls}">'
+            f'<div class="count">{summary.get(sev, 0)}</div>'
+            f'<div class="label">{e(sev)}</div></div>'
+        )
+    parts.append(
+        f'<div class="card total">'
+        f'<div class="count">{summary["TOTAL"]}</div>'
+        f'<div class="label">TOTAL</div></div>'
+    )
+    parts.append("</div></section>")
+
+    parts.append('<section><h2>Findings</h2>')
+    if not findings:
+        parts.append('<p class="empty">No credential exposures detected.</p>')
+    else:
+        parts.append('<table class="findings"><thead><tr>'
+                     '<th>#</th><th>Severity</th><th>Conf</th><th>Class</th>'
+                     '<th>Attribute</th><th>Detection</th><th>Object</th>'
+                     '<th>Matched value</th><th>Notes</th>'
+                     '</tr></thead><tbody>')
+        for i, f in enumerate(findings, 1):
+            sev_cls = {SEV_CRITICAL: "crit", SEV_HIGH: "high",
+                       SEV_MEDIUM: "med", SEV_LOW: "low"}.get(f.severity, "low")
+            parts.append(
+                f'<tr class="sev-{sev_cls}">'
+                f"<td>{i}</td>"
+                f'<td><span class="badge sev-{sev_cls}">{e(f.severity)}</span></td>'
+                f"<td>{f.confidence}</td>"
+                f"<td>{e(f.attribute_classification)}</td>"
+                f"<td><code>{e(f.attribute_name)}</code></td>"
+                f"<td>{e(f.detection_type)}</td>"
+                f'<td class="dn">{e(f.object_dn)}</td>'
+                f'<td><code>{e(_mask(f.matched_value, mask))}</code></td>'
+                f"<td>{e(f.notes or '')}</td>"
+                f"</tr>"
+            )
+        parts.append("</tbody></table>")
+    parts.append("</section>")
+
+    if report.custom_attribute_dump:
+        parts.append('<section><h2>Custom attribute dump</h2>')
+        parts.append('<table class="dump"><thead><tr>'
+                     '<th>Object</th><th>Class</th><th>Attribute</th><th>Value</th>'
+                     '</tr></thead><tbody>')
+        for d in report.custom_attribute_dump:
+            parts.append(
+                f"<tr>"
+                f'<td class="dn">{e(d.object_dn)}</td>'
+                f"<td>{e(d.object_class)}</td>"
+                f"<td><code>{e(d.attribute_name)}</code></td>"
+                f"<td><code>{e(_mask(d.value, mask))}</code></td>"
+                f"</tr>"
+            )
+        parts.append("</tbody></table></section>")
+
+    if grouped:
+        parts.append('<section><h2>Checked attributes per object</h2>')
+        parts.append(
+            '<p class="hint">Every credential-prone built-in attribute '
+            '(<code>description</code>, <code>info</code>, <code>comment</code>, '
+            'etc.) plus any custom attributes — '
+            f'{len(grouped)} object(s).</p>'
+        )
+        for obj in grouped.values():
+            parts.append('<article class="object-card">')
+            parts.append(
+                f'<header><span class="dn">{e(obj["object_dn"])}</span>'
+                f' <span class="oc">{e(obj["object_class"] or "")}</span></header>'
+            )
+            for bucket_label, bucket_key in (
+                ("Common (credential-prone) attributes", "common"),
+                ("Custom attributes", "custom"),
+            ):
+                rows = obj[bucket_key]
+                if not rows:
+                    continue
+                parts.append(f'<h3>{e(bucket_label)}</h3>')
+                parts.append('<table class="attrs"><thead><tr>'
+                             '<th>Attribute</th><th>Class</th>'
+                             '<th>Finding?</th><th>Value</th>'
+                             '</tr></thead><tbody>')
+                for c in rows:
+                    parts.append(
+                        f'<tr class="{"hit" if c.has_finding else ""}">'
+                        f"<td><code>{e(c.attribute_name)}</code></td>"
+                        f"<td>{e(c.attribute_classification)}</td>"
+                        f'<td>{"yes" if c.has_finding else "no"}</td>'
+                        f'<td><code>{e(_mask(c.value, mask))}</code></td>'
+                        f"</tr>"
+                    )
+                parts.append("</tbody></table>")
+            parts.append("</article>")
+        parts.append("</section>")
+
+    parts.append(f'<footer>passdiger v{VERSION}</footer>')
+    parts.append("</body></html>")
+    return "\n".join(parts) + "\n"
+
+
+_HTML_STYLE = """\
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fafafa;
+  --fg: #1a1a1a;
+  --muted: #666;
+  --border: #d8d8d8;
+  --card: #fff;
+  --crit: #c62828;
+  --high: #ef6c00;
+  --med:  #f9a825;
+  --low:  #2e7d32;
+  --hit-bg: #fff3e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#161616; --fg:#eee; --muted:#aaa; --border:#333; --card:#1e1e1e; --hit-bg:#3a2a10; }
+}
+* { box-sizing: border-box; }
+body {
+  font: 14px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background: var(--bg); color: var(--fg);
+  margin: 0; padding: 32px; max-width: 1400px;
+}
+h1 { font-size: 24px; margin: 0 0 24px; font-weight: 600; }
+h2 { font-size: 18px; margin: 32px 0 12px; font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+h3 { font-size: 14px; margin: 16px 0 8px; font-weight: 600; color: var(--muted); }
+section { margin-bottom: 24px; }
+table { border-collapse: collapse; width: 100%; background: var(--card); }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-weight: 600; background: rgba(0,0,0,.03); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.meta table { width: auto; }
+.meta th { background: transparent; text-transform: none; letter-spacing: 0; padding-right: 24px; color: var(--muted); }
+code { font: 12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; word-break: break-all; }
+.dn { font: 11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; color: var(--muted); }
+.hint { color: var(--muted); font-size: 13px; }
+.empty { color: var(--muted); padding: 16px; background: var(--card); border-radius: 4px; }
+.cards { display: flex; gap: 12px; flex-wrap: wrap; }
+.card { padding: 12px 16px; background: var(--card); border: 1px solid var(--border); border-radius: 6px; min-width: 96px; }
+.card .count { font-size: 24px; font-weight: 600; }
+.card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.card.sev-crit  { border-left: 4px solid var(--crit); }
+.card.sev-high  { border-left: 4px solid var(--high); }
+.card.sev-med   { border-left: 4px solid var(--med);  }
+.card.sev-low   { border-left: 4px solid var(--low);  }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #fff; }
+.badge.sev-crit { background: var(--crit); }
+.badge.sev-high { background: var(--high); }
+.badge.sev-med  { background: var(--med);  color:#000; }
+.badge.sev-low  { background: var(--low);  }
+tr.hit { background: var(--hit-bg); }
+.object-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+.object-card header { margin-bottom: 8px; }
+.object-card .oc { color: var(--muted); font-size: 12px; }
+footer { margin-top: 48px; color: var(--muted); font-size: 12px; }
+</style>"""
 
 
 def _write_header(out: io.StringIO, report: AuditReport) -> None:
@@ -1283,8 +1892,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     detect.add_argument(
         "--min-confidence",
         type=int,
-        default=55,
-        help="Minimum confidence score to report (0-100, default: 55)",
+        default=20,
+        help="Minimum confidence score to report (0-100, default: 20)",
     )
     detect.add_argument(
         "--only-common",
@@ -1297,6 +1906,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Print every custom attribute and value, even with no findings",
     )
     detect.add_argument(
+        "--dump-checked-attrs",
+        action="store_true",
+        help=(
+            "For each object, emit every credential-prone built-in attribute "
+            "(description, info, comment, etc.) plus any custom attributes — "
+            "even when no finding fired. Output respects -o/--output-format."
+        ),
+    )
+    detect.add_argument(
         "--mask-values",
         action="store_true",
         help="Mask matched values in output (helpful when sharing reports)",
@@ -1306,7 +1924,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     out.add_argument(
         "-o",
         "--output-format",
-        choices=["table", "json", "csv"],
+        choices=["table", "json", "csv", "html"],
         default="table",
         help="Output format (default: table)",
     )
@@ -1454,16 +2072,18 @@ def run(args: argparse.Namespace) -> int:
                 page_size=args.page_size,
             ):
                 report.objects_scanned += 1
-                findings, dumps, attrs_scanned = audit_entry(
+                findings, dumps, checked, attrs_scanned = audit_entry(
                     entry,
                     detector=detector,
                     builtin_attrs=builtin_attrs,
                     custom_attrs=custom_attrs,
                     show_all_custom=args.show_all_custom,
                     inspect_only_common=args.only_common,
+                    dump_checked_attrs=args.dump_checked_attrs,
                 )
                 report.findings.extend(findings)
                 report.custom_attribute_dump.extend(dumps)
+                report.checked_attribute_dump.extend(checked)
                 report.attributes_scanned += attrs_scanned
                 if args.max_objects and report.objects_scanned >= args.max_objects:
                     progress(
@@ -1501,6 +2121,8 @@ def run(args: argparse.Namespace) -> int:
         rendered = format_json(report, mask=args.mask_values)
     elif args.output_format == "csv":
         rendered = format_csv(report, mask=args.mask_values)
+    elif args.output_format == "html":
+        rendered = format_html(report, mask=args.mask_values)
     else:
         rendered = format_table(report, mask=args.mask_values)
 
