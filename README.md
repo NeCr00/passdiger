@@ -27,7 +27,7 @@ pipx install .
 From a Git repository:
 
 ```
-pipx install git+https://github.com/<NeCr00>/passdiger.git
+pipx install git+https://github.com/NeCr00/passdiger.git
 ```
 
 Or in the current environment:
