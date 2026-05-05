@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "passdiger"
+version = "1.0.0"
+description = "Active Directory credential exposure auditor"
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["active-directory", "ldap", "security", "audit", "credentials"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration :: Authentication/Directory :: LDAP",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+dependencies = [
+    "ldap3>=2.9",
+]
+
+[project.scripts]
+passdiger = "passdiger:main"
+
+[tool.setuptools]
+py-modules = ["passdiger"]
