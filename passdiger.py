@@ -713,11 +713,17 @@ def build_server(
             tls = ldap3.Tls(validate=ssl.CERT_REQUIRED, version=ssl.PROTOCOL_TLS_CLIENT)
         else:
             tls = ldap3.Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLS_CLIENT)
+    # Important: use DSA (rootDSE only) — NOT ALL — for the bind-time
+    # info fetch. AD allows anonymous reads of rootDSE but blocks the
+    # schema partition (CN=Schema,CN=Configuration,...). With get_info=ALL
+    # ldap3 would auto-query the schema during bind and the resulting
+    # NO_OBJECT error escapes the Connection() constructor before our
+    # explicit schema discovery (which has graceful fallback) ever runs.
     return ldap3.Server(
         host=host,
         port=port,
         use_ssl=use_ssl,
-        get_info=ldap3.ALL,
+        get_info=ldap3.DSA,
         connect_timeout=timeout,
         tls=tls,
     )
@@ -1369,7 +1375,20 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
         )
     except LDAPException as exc:
-        sys.stderr.write(f"ERROR: LDAP bind failed: {exc}\n")
+        sys.stderr.write(f"ERROR: LDAP connection setup failed: {exc}\n")
+        msg = str(exc).lower()
+        if "noobject" in msg or "noSuchObject".lower() in msg or "insufficientaccess" in msg:
+            sys.stderr.write(
+                "  Hint: this looks like a permission error during the bind-time\n"
+                "        rootDSE/schema fetch. If you are using anonymous bind on AD,\n"
+                "        much of the directory is restricted by default — try -u/-p\n"
+                "        with a domain account.\n"
+            )
+        elif "invalidcredentials" in msg or "strongerauthrequired" in msg:
+            sys.stderr.write(
+                "  Hint: the credentials were rejected. Verify the username format\n"
+                "        (UPN like user@domain or NETBIOS\\sam) and the password.\n"
+            )
         return 3
     except ValueError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
