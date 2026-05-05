@@ -273,6 +273,25 @@ PATTERNS: List[Tuple[str, "re.Pattern[str]", int, str]] = [
         SEV_HIGH,
     ),
     (
+        # Noun-first form of the imperative: "Password set to X",
+        # "the secret was reset to Y", "pwd is changed to Z".
+        # This is the most common AD-description shape for accidentally
+        # disclosed cleartext passwords (e.g. "Account created. Password
+        # set to Welcome123!"). High-severity, narrow regex so it fires
+        # only when the credential keyword is followed by a real
+        # set/reset/changed verb plus a connector.
+        "password_set_to_phrase",
+        re.compile(
+            r"(?ix)\b(?:password|passwd|pwd|pass|secret|passphrase|passcode)\b"
+            r"\s+(?:(?:is|was|has\s+been|got)\s+)?"
+            r"(?:set|reset|changed|updated|configured)\s+"
+            r"(?:to|as|=|->)\s+"
+            r"['\"`]?(?P<val>[^\s,;'\"`<>]{4,200})['\"`]?"
+        ),
+        94,
+        SEV_CRITICAL,
+    ),
+    (
         # Context-bracketed credential pair: a credential keyword nearby
         # plus a "user:pass" or "user/pass" pair.
         # Examples:
@@ -771,11 +790,12 @@ class CredentialDetector:
             conf -= 30
 
         # password_keyvalue / default_password_phrase / set_password_phrase /
-        # cli_password_flag: avoid flagging prose like "password reset
-        # required" or "password policy: ...".
+        # password_set_to_phrase / cli_password_flag: avoid flagging prose
+        # like "password reset required" or "password policy: ...".
         if label in {
             "password_keyvalue", "default_password_phrase",
-            "set_password_phrase", "cli_password_flag",
+            "set_password_phrase", "password_set_to_phrase",
+            "cli_password_flag",
         }:
             if clean.lower() in PROSE_REJECT_WORDS:
                 return 0, ""
